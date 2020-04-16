@@ -3,14 +3,17 @@ package pcsconfig
 
 import (
 	"github.com/iikira/BaiduPCS-Go/baidupcs"
+	"github.com/iikira/BaiduPCS-Go/baidupcs/dlinkclient"
 	"github.com/iikira/BaiduPCS-Go/pcsutil"
+	"github.com/iikira/BaiduPCS-Go/pcsutil/jsonhelper"
 	"github.com/iikira/BaiduPCS-Go/pcsverbose"
+	"github.com/iikira/BaiduPCS-Go/requester"
 	"github.com/json-iterator/go"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
-	"unsafe"
 )
 
 const (
@@ -30,21 +33,33 @@ var (
 
 // PCSConfig 配置详情
 type PCSConfig struct {
-	baiduActiveUID  uint64
-	baiduUserList   BaiduUserList
-	appID           int    // appid
-	cacheSize       int    // 下载缓存
-	maxParallel     int    // 最大下载并发量
-	maxDownloadLoad int    // 同时进行下载文件的最大数量
-	userAgent       string // 浏览器标识
-	saveDir         string // 下载储存路径
-	enableHTTPS     bool   // 启用https
+	BaiduActiveUID uint64        `json:"baidu_active_uid"`
+	BaiduUserList  BaiduUserList `json:"baidu_user_list"`
+
+	AppID int `json:"appid"` // appid
+
+	CacheSize         int `json:"cache_size"`          // 下载缓存
+	MaxParallel       int `json:"max_parallel"`        // 最大下载并发量
+	MaxUploadParallel int `json:"max_upload_parallel"` // 最大上传并发量
+	MaxDownloadLoad   int `json:"max_download_load"`   // 同时进行下载文件的最大数量
+
+	MaxDownloadRate int64 `json:"max_download_rate"` // 限制最大下载速度
+	MaxUploadRate   int64 `json:"max_upload_rate"`   // 限制最大上传速度
+
+	UserAgent   string `json:"user_agent"`   // 浏览器标识
+	PCSUA       string `json:"pcs_ua"`       // PCS浏览器标识
+	PanUA       string `json:"pan_ua"`       // PAN浏览器标识
+	SaveDir     string `json:"savedir"`      // 下载储存路径
+	EnableHTTPS bool   `json:"enable_https"` // 启用https
+	Proxy       string `json:"proxy"`        // 代理
+	LocalAddrs  string `json:"local_addrs"`  // 本地网卡地址
 
 	configFilePath string
 	configFile     *os.File
 	fileMu         sync.Mutex
 	activeUser     *Baidu
 	pcs            *baidupcs.BaiduPCS
+	dc             *dlinkclient.DlinkClient
 }
 
 // NewConfig 返回 PCSConfig 指针对象
@@ -52,7 +67,6 @@ func NewConfig(configFilePath string) *PCSConfig {
 	c := &PCSConfig{
 		configFilePath: configFilePath,
 	}
-	c.defaultConfig()
 	return c
 }
 
@@ -89,7 +103,7 @@ func (c *PCSConfig) Save() error {
 	c.fileMu.Lock()
 	defer c.fileMu.Unlock()
 
-	data, err := jsoniter.MarshalIndent((*pcsConfigJSONExport)(unsafe.Pointer(c)), "", " ")
+	data, err := jsoniter.MarshalIndent(c, "", " ")
 	if err != nil {
 		// json数据生成失败
 		panic(err)
@@ -118,6 +132,8 @@ func (c *PCSConfig) init() error {
 	if c.configFilePath == "" {
 		return ErrConfigFileNotExist
 	}
+
+	c.initDefaultConfig()
 	err := c.loadConfigFromFile()
 	if err != nil {
 		return err
@@ -125,17 +141,24 @@ func (c *PCSConfig) init() error {
 
 	// 载入配置
 	// 如果 activeUser 已初始化, 则跳过
-	if c.activeUser != nil && c.activeUser.UID == c.baiduActiveUID {
+	if c.activeUser != nil && c.activeUser.UID == c.BaiduActiveUID {
 		return nil
 	}
 
 	c.activeUser, err = c.GetBaiduUser(&BaiduBase{
-		UID: c.baiduActiveUID,
+		UID: c.BaiduActiveUID,
 	})
 	if err != nil {
 		return err
 	}
 	c.pcs = c.activeUser.BaiduPCS()
+
+	// 设置全局User-Agent
+	requester.UserAgent = c.UserAgent
+	// 设置全局代理
+	requester.SetGlobalProxy(c.Proxy)
+	// 设置本地网卡地址
+	requester.SetLocalTCPAddrList(strings.Split(c.LocalAddrs, ",")...)
 
 	return nil
 }
@@ -189,44 +212,38 @@ func (c *PCSConfig) loadConfigFromFile() (err error) {
 		return err
 	}
 
-	d := jsoniter.NewDecoder(c.configFile)
-	err = d.Decode((*pcsConfigJSONExport)(unsafe.Pointer(c)))
+	err = jsonhelper.UnmarshalData(c.configFile, c)
 	if err != nil {
 		return ErrConfigContentsParseError
 	}
 	return nil
 }
 
-func (c *PCSConfig) defaultConfig() {
-	if c.appID == 0 {
-		c.appID = 260149
-	}
-	if c.cacheSize == 0 {
-		c.cacheSize = 30000
-	}
-	if c.maxParallel == 0 {
-		c.maxParallel = 100
-	}
-	if c.maxDownloadLoad == 0 {
-		c.maxDownloadLoad = 1
-	}
+func (c *PCSConfig) initDefaultConfig() {
+	c.AppID = 266719
+	c.CacheSize = 65536
+	c.MaxParallel = 1
+	c.MaxUploadParallel = 8
+	c.MaxDownloadLoad = 1
+	c.UserAgent = requester.UserAgent
+	c.PCSUA = ""
+	c.PanUA = baidupcs.NetdiskUA
+	c.EnableHTTPS = true
 
 	// 设置默认的下载路径
-	if c.saveDir == "" {
-		switch runtime.GOOS {
-		case "windows":
-			c.saveDir = pcsutil.ExecutablePathJoin("Downloads")
-		case "android":
-			// TODO: 获取完整的的下载路径
-			c.saveDir = "/sdcard/Download"
-		default:
-			dataPath, ok := os.LookupEnv("HOME")
-			if !ok {
-				pcsConfigVerbose.Warn("Environment HOME not set")
-				c.saveDir = pcsutil.ExecutablePathJoin("Downloads")
-			} else {
-				c.saveDir = filepath.Join(dataPath, "Downloads")
-			}
+	switch runtime.GOOS {
+	case "windows":
+		c.SaveDir = pcsutil.ExecutablePathJoin("Downloads")
+	case "android":
+		// TODO: 获取完整的的下载路径
+		c.SaveDir = "/sdcard/Download"
+	default:
+		dataPath, ok := os.LookupEnv("HOME")
+		if !ok {
+			pcsConfigVerbose.Warn("Environment HOME not set")
+			c.SaveDir = pcsutil.ExecutablePathJoin("Downloads")
+		} else {
+			c.SaveDir = filepath.Join(dataPath, "Downloads")
 		}
 	}
 }
@@ -278,13 +295,16 @@ func GetConfigDir() string {
 }
 
 func (c *PCSConfig) fix() {
-	if c.cacheSize < 1024 {
-		c.cacheSize = 1024
+	if c.CacheSize < 1024 {
+		c.CacheSize = 1024
 	}
-	if c.maxParallel < 1 {
-		c.maxParallel = 1
+	if c.MaxParallel < 1 {
+		c.MaxParallel = 1
 	}
-	if c.maxDownloadLoad < 1 {
-		c.maxDownloadLoad = 1
+	if c.MaxUploadParallel < 1 {
+		c.MaxUploadParallel = 1
+	}
+	if c.MaxDownloadLoad < 1 {
+		c.MaxDownloadLoad = 1
 	}
 }

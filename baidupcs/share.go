@@ -2,131 +2,92 @@ package baidupcs
 
 import (
 	"errors"
-	"github.com/iikira/baidu-tools/pan"
-	"github.com/json-iterator/go"
-	"net/url"
-	"strconv"
+	"github.com/iikira/BaiduPCS-Go/baidupcs/pcserror"
 	"strings"
 )
 
-// ShareOption 分享可选项
-type ShareOption struct {
-	Password string // 密码
-	Period   int    // 有效期
-}
-
-// Shared 分享信息
-type Shared struct {
-	Link    string `json:"link"`
-	ShareID int64  `json:"shareid"`
-}
-
-// ShareRecordInfo 分享信息
-type ShareRecordInfo struct {
-	ShareID     int64    `json:"shareId"`
-	FsIds       []string `json:"fsIds"`
-	Passwd      string   `json:"passwd"`
-	Shortlink   string   `json:"shortlink"`
-	TypicalPath string   `json:"typicalPath"`
-}
-
-// Clean 清理
-func (sri *ShareRecordInfo) Clean() {
-	if sri.Passwd == "0" {
-		sri.Passwd = ""
+type (
+	// ShareOption 分享可选项
+	ShareOption struct {
+		Password string // 密码
+		Period   int    // 有效期
 	}
-}
 
-// HasPasswd 是否需要提取码
-func (sri *ShareRecordInfo) HasPasswd() bool {
-	return sri.Passwd != "" && sri.Passwd != "0"
-}
-
-// ShareRecordInfoList 分享信息列表
-type ShareRecordInfoList []*ShareRecordInfo
-
-// Clean 清理
-func (sril *ShareRecordInfoList) Clean() {
-	for _, sri := range *sril {
-		if sri == nil {
-			continue
-		}
-
-		sri.Clean()
+	// Shared 分享信息
+	Shared struct {
+		Link    string `json:"link"`
+		ShareID int64  `json:"shareid"`
 	}
-}
+
+	// ShareRecordInfo 分享信息
+	ShareRecordInfo struct {
+		ShareID         int64   `json:"shareId"`
+		FsIds           []int64 `json:"fsIds"`
+		Passwd          string  `json:"-"` // 这个字段已经没有用了, 需要从ShareSURLInfo中获取
+		Shortlink       string  `json:"shortlink"`
+		Status          int     `json:"status"`          // 状态
+		Public          int     `json:"public"`          // 是否为公开分享
+		TypicalCategory int     `json:"typicalCategory"` // 文件类型
+		TypicalPath     string  `json:"typicalPath"`
+	}
+
+	shareSURLInfo struct {
+		*pcserror.PanErrorInfo
+		*ShareSURLInfo
+	}
+
+	// ShareSURLInfo 分享的子信息
+	ShareSURLInfo struct {
+		Pwd      string `json:"pwd"` // 新密码
+		ShortURL string `json:"shorturl"`
+	}
+
+	// ShareRecordInfoList 分享信息列表
+	ShareRecordInfoList []*ShareRecordInfo
+
+	sharePSetJSON struct {
+		*Shared
+		*pcserror.PanErrorInfo
+	}
+
+	shareListJSON struct {
+		List ShareRecordInfoList `json:"list"`
+		*pcserror.PanErrorInfo
+	}
+)
+
+var (
+	// ErrShareLinkNotFound 未找到分享链接
+	ErrShareLinkNotFound = errors.New("未找到分享链接")
+)
 
 // ShareSet 分享文件
-func (pcs *BaiduPCS) ShareSet(paths []string, option *ShareOption) (s *Shared, pcsError Error) {
-	pcs.lazyInit()
-
+func (pcs *BaiduPCS) ShareSet(paths []string, option *ShareOption) (s *Shared, pcsError pcserror.Error) {
 	if option == nil {
 		option = &ShareOption{}
 	}
 
-	pcsURL := &url.URL{
-		Scheme: GetHTTPScheme(pcs.isHTTPS),
-		Host:   "pan.baidu.com",
-		Path:   "share/pset",
+	dataReadCloser, pcsError := pcs.PrepareSharePSet(paths, option.Period)
+	if pcsError != nil {
+		return
 	}
 
-	builder := &strings.Builder{}
-	builder.WriteRune('[')
-	for k := range paths {
-		builder.WriteString("\"" + paths[k] + "\"")
-		if k < len(paths)-1 {
-			builder.WriteRune(',')
-		}
-	}
-	builder.WriteRune(']')
+	defer dataReadCloser.Close()
 
-	errInfo := NewErrorInfo(OperationShareSet)
-	baiduPCSVerbose.Infof("%s URL: %s\n", OperationShareSet, pcsURL)
-
-	resp, err := pcs.client.Req("POST", pcsURL.String(), map[string]string{
-		"path_list":    builder.String(),
-		"schannel":     "0",
-		"channel_list": "[]",
-		"period":       strconv.Itoa(option.Period),
-	}, map[string]string{
-		"Content-Type": "application/x-www-form-urlencoded",
-		"User-Agent":   "netdisk;8.3.1",
-	})
-	if resp != nil {
-		defer resp.Body.Close()
-	}
-	if err != nil {
-		errInfo.errType = ErrTypeNetError
-		errInfo.err = err
-		return nil, errInfo
+	errInfo := pcserror.NewPanErrorInfo(OperationShareSet)
+	jsonData := sharePSetJSON{
+		Shared:       &Shared{},
+		PanErrorInfo: errInfo,
 	}
 
-	s = &Shared{}
-	jsonData := struct {
-		*Shared
-		*pan.RemoteErrInfo
-	}{
-		Shared:        s,
-		RemoteErrInfo: &pan.RemoteErrInfo{},
-	}
-
-	d := jsoniter.NewDecoder(resp.Body)
-	err = d.Decode(&jsonData)
-	if err != nil {
-		errInfo.jsonError(err)
-		return nil, errInfo
-	}
-
-	if jsonData.RemoteErrInfo.ErrNo != 0 {
-		jsonData.RemoteErrInfo.ParseErrMsg()
-		errInfo.ErrCode = jsonData.RemoteErrInfo.ErrNo
-		errInfo.ErrMsg = jsonData.RemoteErrInfo.ErrMsg
-		return nil, errInfo
+	pcsError = pcserror.HandleJSONParse(OperationShareSet, dataReadCloser, &jsonData)
+	if pcsError != nil {
+		return
 	}
 
 	if jsonData.Link == "" {
-		errInfo.errType = ErrTypeOthers
-		errInfo.err = errors.New("未找到分享链接")
+		errInfo.ErrType = pcserror.ErrTypeOthers
+		errInfo.Err = ErrShareLinkNotFound
 		return nil, errInfo
 	}
 
@@ -134,125 +95,80 @@ func (pcs *BaiduPCS) ShareSet(paths []string, option *ShareOption) (s *Shared, p
 }
 
 // ShareCancel 取消分享
-func (pcs *BaiduPCS) ShareCancel(shareIDs []int64) (pcsError Error) {
-	pcs.lazyInit()
-
-	pcsURL := &url.URL{
-		Scheme: GetHTTPScheme(pcs.isHTTPS),
-		Host:   "pan.baidu.com",
-		Path:   "share/cancel",
+func (pcs *BaiduPCS) ShareCancel(shareIDs []int64) (pcsError pcserror.Error) {
+	dataReadCloser, pcsError := pcs.PrepareShareCancel(shareIDs)
+	if pcsError != nil {
+		return
 	}
 
-	builder := &strings.Builder{}
-	builder.WriteRune('[')
-	for k := range shareIDs {
-		builder.WriteString(strconv.FormatInt(shareIDs[k], 10))
-		if k < len(shareIDs)-1 {
-			builder.WriteRune(',')
-		}
-	}
-	builder.WriteRune(']')
+	defer dataReadCloser.Close()
 
-	errInfo := NewErrorInfo(OperationShareCancel)
-	baiduPCSVerbose.Infof("%s URL: %s\n", OperationShareCancel, pcsURL)
-
-	resp, err := pcs.client.Req("POST", pcsURL.String(), map[string]string{
-		"shareid_list": builder.String(),
-	}, map[string]string{
-		"Content-Type": "application/x-www-form-urlencoded",
-		"User-Agent":   "netdisk;8.3.1",
-	})
-	if resp != nil {
-		defer resp.Body.Close()
-	}
-	if err != nil {
-		errInfo.errType = ErrTypeNetError
-		errInfo.err = err
-		return errInfo
-	}
-
-	jsonData := struct {
-		*pan.RemoteErrInfo
-	}{
-		RemoteErrInfo: &pan.RemoteErrInfo{},
-	}
-
-	d := jsoniter.NewDecoder(resp.Body)
-	err = d.Decode(&jsonData)
-	if err != nil {
-		errInfo.jsonError(err)
-		return errInfo
-	}
-
-	if jsonData.RemoteErrInfo.ErrNo != 0 {
-		jsonData.RemoteErrInfo.ParseErrMsg()
-		errInfo.ErrCode = jsonData.RemoteErrInfo.ErrNo
-		errInfo.ErrMsg = jsonData.RemoteErrInfo.ErrMsg
-		return errInfo
-	}
-
-	return nil
+	pcsError = pcserror.DecodePanJSONError(OperationShareCancel, dataReadCloser)
+	return
 }
 
 // ShareList 列出分享列表
-func (pcs *BaiduPCS) ShareList(page int) (records ShareRecordInfoList, pcsError Error) {
-	pcs.lazyInit()
-
-	query := url.Values{}
-	query.Set("page", strconv.Itoa(page))
-	query.Set("desc", "1")
-	query.Set("order", "time")
-
-	pcsURL := &url.URL{
-		Scheme:   GetHTTPScheme(pcs.isHTTPS),
-		Host:     "pan.baidu.com",
-		Path:     "share/record",
-		RawQuery: query.Encode(),
+func (pcs *BaiduPCS) ShareList(page int) (records ShareRecordInfoList, pcsError pcserror.Error) {
+	dataReadCloser, pcsError := pcs.PrepareShareList(page)
+	if pcsError != nil {
+		return
 	}
 
-	errInfo := NewErrorInfo(OperationShareList)
-	baiduPCSVerbose.Infof("%s URL: %s\n", OperationShareList, pcsURL)
+	defer dataReadCloser.Close()
 
-	resp, err := pcs.client.Req("GET", pcsURL.String(), nil, map[string]string{
-		"User-Agent": "netdisk;8.3.1",
-	})
-	if resp != nil {
-		defer resp.Body.Close()
-	}
-	if err != nil {
-		errInfo.errType = ErrTypeNetError
-		errInfo.err = err
-		return nil, errInfo
+	errInfo := pcserror.NewPanErrorInfo(OperationShareList)
+	jsonData := shareListJSON{
+		List:         records,
+		PanErrorInfo: errInfo,
 	}
 
-	jsonData := struct {
-		List ShareRecordInfoList `json:"list"`
-		*pan.RemoteErrInfo
-	}{
-		List:          records,
-		RemoteErrInfo: &pan.RemoteErrInfo{},
-	}
-
-	d := jsoniter.NewDecoder(resp.Body)
-	err = d.Decode(&jsonData)
-	if err != nil {
-		errInfo.jsonError(err)
-		return nil, errInfo
-	}
-
-	if jsonData.RemoteErrInfo.ErrNo != 0 {
-		jsonData.RemoteErrInfo.ParseErrMsg()
-		errInfo.ErrCode = jsonData.RemoteErrInfo.ErrNo
-		errInfo.ErrMsg = jsonData.RemoteErrInfo.ErrMsg
-		return nil, errInfo
+	pcsError = pcserror.HandleJSONParse(OperationShareList, dataReadCloser, &jsonData)
+	if pcsError != nil {
+		// json解析错误
+		if pcsError.GetErrType() == pcserror.ErrTypeJSONParseError {
+			// 服务器更改, List为空时变成{}, 导致解析错误
+			if strings.Contains(pcsError.GetError().Error(), `"list":{}`) {
+				// 返回空列表
+				return jsonData.List, nil
+			}
+		}
+		return
 	}
 
 	if jsonData.List == nil {
-		errInfo.errType = ErrTypeOthers
-		errInfo.err = errors.New("shared list is nil")
+		errInfo.ErrType = pcserror.ErrTypeOthers
+		errInfo.Err = errors.New("shared list is nil")
 		return nil, errInfo
 	}
 
-	jsonData.List.Clean()
 	return jsonData.List, nil
+}
+
+//ShareSURLInfo 获取分享的详细信息, 包含密码
+func (pcs *BaiduPCS) ShareSURLInfo(shareID int64) (info *ShareSURLInfo, pcsError pcserror.Error) {
+	dataReadCloser, pcsError := pcs.PrepareShareSURLInfo(shareID)
+	if pcsError != nil {
+		return
+	}
+
+	defer dataReadCloser.Close()
+
+	errInfo := pcserror.NewPanErrorInfo(OperationShareSURLInfo)
+
+	jsonData := shareSURLInfo{
+		PanErrorInfo: errInfo,
+	}
+
+	pcsError = pcserror.HandleJSONParse(OperationShareList, dataReadCloser, &jsonData)
+	if pcsError != nil {
+		// json解析错误
+		return
+	}
+
+	// 去掉0
+	if jsonData.Pwd == "0" {
+		jsonData.Pwd = ""
+	}
+
+	return jsonData.ShareSURLInfo, nil
 }
